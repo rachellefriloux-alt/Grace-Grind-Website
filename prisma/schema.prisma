@@ -1,0 +1,142 @@
+// Grace & Grind — Prisma schema
+// Database: MySQL (Railway)
+// Connection: DATABASE_URL environment variable
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "mysql"
+  url      = env("DATABASE_URL")
+}
+
+model Client {
+  id                String   @id @default(uuid())
+  created_at        DateTime @default(now())
+  name              String   @db.VarChar(160)
+  email             String   @unique @db.VarChar(320)
+  phone             String   @default("") @db.VarChar(80)
+  address           String   @default("") @db.VarChar(500)
+  preferred_contact String   @default("Email") @db.VarChar(80)
+  notes             String   @default("") @db.Text
+
+  bookings      Booking[]
+  messages      Message[]
+  notifications Notification[]
+  documents     Document[]
+  payments      Payment[]
+  files         File[]
+
+  @@map("clients")
+}
+
+model Booking {
+  id                 String   @id @default(uuid())
+  created_at         DateTime @default(now())
+  client_email       String   @db.VarChar(320)
+  name               String   @db.VarChar(160)
+  email              String   @db.VarChar(320)
+  phone              String   @default("") @db.VarChar(80)
+  service_type       String   @db.VarChar(200)
+  subscriber_plan    String   @default("") @db.VarChar(200)
+  preferred_date     String   @default("") @db.VarChar(80)
+  preferred_time     String   @default("") @db.VarChar(80)
+  hours              Float    @default(1)
+  notes              String   @default("") @db.Text
+  payment_preference String   @default("Discuss first") @db.VarChar(80)
+  rate_label         String   @default("") @db.VarChar(80)
+  amount_cents       Int?
+  status             String   @default("requested") @db.VarChar(80)
+  payment_status     String   @default("unpaid") @db.VarChar(80)
+
+  client   Client    @relation(fields: [client_email], references: [email], onDelete: Cascade)
+  payments Payment[]
+
+  @@index([client_email])
+  @@map("bookings")
+}
+
+model Message {
+  id             String   @id @default(uuid())
+  created_at     DateTime @default(now())
+  client_email   String   @db.VarChar(320)
+  from           String   @db.VarChar(10) // "client" | "admin"
+  subject        String   @default("") @db.VarChar(180)
+  body           String   @db.Text
+  read_by_admin  Boolean  @default(false)
+  read_by_client Boolean  @default(false)
+
+  client Client @relation(fields: [client_email], references: [email], onDelete: Cascade)
+
+  @@index([client_email])
+  @@map("messages")
+}
+
+model Notification {
+  id           String   @id @default(uuid())
+  created_at   DateTime @default(now())
+  client_email String   @db.VarChar(320)
+  title        String   @db.VarChar(180)
+  body         String   @db.Text
+  type         String   @default("update") @db.VarChar(80)
+  read         Boolean  @default(false)
+
+  client Client @relation(fields: [client_email], references: [email], onDelete: Cascade)
+
+  @@index([client_email])
+  @@map("notifications")
+}
+
+model Document {
+  id           String    @id @default(uuid())
+  created_at   DateTime  @default(now())
+  client_email String    @db.VarChar(320)
+  title        String    @db.VarChar(180)
+  body         String    @db.LongText
+  status       String    @default("needs_signature") @db.VarChar(40)
+  signed_at    DateTime?
+  signer_name  String?   @db.VarChar(160)
+
+  client Client @relation(fields: [client_email], references: [email], onDelete: Cascade)
+
+  @@index([client_email])
+  @@map("documents")
+}
+
+model Payment {
+  id                String   @id @default(uuid())
+  created_at        DateTime @default(now())
+  client_email      String   @db.VarChar(320)
+  booking_id        String?  @db.VarChar(36)
+  stripe_session_id String?  @db.VarChar(200)
+  checkout_url      String?  @db.VarChar(2000)
+  amount_cents      Int
+  mode              String   @db.VarChar(20) // "payment" | "subscription"
+  status            String   @default("created") @db.VarChar(80)
+
+  client  Client   @relation(fields: [client_email], references: [email], onDelete: Cascade)
+  booking Booking? @relation(fields: [booking_id], references: [id], onDelete: SetNull)
+
+  @@index([client_email])
+  @@index([stripe_session_id])
+  @@map("payments")
+}
+
+model File {
+  id           String   @id @default(uuid())
+  created_at   DateTime @default(now())
+  client_email String   @db.VarChar(320)
+  uploaded_by  String   @db.VarChar(10) // "client" | "admin"
+  filename     String   @db.VarChar(255)
+  stored_name  String   @db.VarChar(255)
+  mime_type    String   @db.VarChar(120)
+  size         Int
+  category     String   @default("General") @db.VarChar(80)
+  note         String   @default("") @db.Text
+
+  client Client @relation(fields: [client_email], references: [email], onDelete: Cascade)
+
+  @@index([client_email])
+  @@map("files")
+}
