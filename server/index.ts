@@ -1,3 +1,4 @@
+import { PrismaClient } from "@prisma/client";
 import express from "express";
 import { randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
@@ -12,6 +13,7 @@ import {
   serviceCategories,
   subscriberPlans,
 } from "../shared/business";
+import { createTrpcContext, router, trpcExpress } from "./trpc";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -22,6 +24,22 @@ const legacyBookingFile =
   process.env.BOOKINGS_FILE || path.resolve(dataDir, "bookings.jsonl");
 const uploadsDir = process.env.UPLOADS_DIR || path.resolve(dataDir, "uploads");
 const maxUploadBytes = 8 * 1024 * 1024;
+
+// ---------------------------------------------------------------------------
+// Prisma client — connects to MySQL via DATABASE_URL.
+// Falls back gracefully when DATABASE_URL is not set (file-based mode).
+// ---------------------------------------------------------------------------
+let prisma: PrismaClient | null = null;
+
+function getPrisma(): PrismaClient | null {
+  if (!process.env.DATABASE_URL) return null;
+  if (!prisma) {
+    prisma = new PrismaClient({
+      log: process.env.NODE_ENV === "development" ? ["warn", "error"] : ["error"],
+    });
+  }
+  return prisma;
+}
 
 type ClientRecord = {
   id: string;
@@ -423,9 +441,39 @@ async function createCheckoutForBooking(
 async function startServer() {
   await loadLocalEnv();
 
+  // Initialise Prisma eagerly so connection errors surface at startup.
+  const db = getPrisma();
+  if (db) {
+    try {
+      await db.$connect();
+      console.log("Prisma connected to MySQL database.");
+    } catch (err) {
+      console.error("Prisma failed to connect:", err);
+      // Non-fatal — server continues in file-based fallback mode.
+    }
+  } else {
+    console.warn(
+      "DATABASE_URL is not set. Running in file-based storage mode. " +
+        "Set DATABASE_URL to enable MySQL persistence.",
+    );
+  }
+
   const app = express();
   const server = createServer(app);
   const staticPath = path.resolve(__dirname, "public");
+
+  // ── tRPC router ────────────────────────────────────────────────────────────
+  // Mounted at /trpc — provides type-safe API procedures for all data models.
+  // Only available when DATABASE_URL is configured.
+  if (db) {
+    app.use(
+      "/trpc",
+      trpcExpress.createExpressMiddleware({
+        router,
+        createContext: createTrpcContext(db, getAdminCode()),
+      }),
+    );
+  }
 
   app.post(
     "/api/stripe/webhook",
@@ -456,19 +504,14 @@ async function startServer() {
         return res.status(400).send(message);
       }
 
-      const store = await readStore();
-      if (
-        event.type === "checkout.session.completed" ||
-        event.type === "checkout.session.async_payment_succeeded" ||
-        event.type === "checkout.session.async_payment_failed"
-      ) {
+      const relevantEvents = new Set([
+        "checkout.session.completed",
+        "checkout.session.async_payment_succeeded",
+        "checkout.session.async_payment_failed",
+      ]);
+
+      if (relevantEvents.has(event.type)) {
         const session = event.data.object as Stripe.Checkout.Session;
-        const payment = store.payments.find(
-          (item) => item.stripe_session_id === session.id,
-        );
-        const booking = store.bookings.find(
-          (item) => item.id === session.metadata?.booking_id,
-        );
         const status =
           event.type === "checkout.session.async_payment_failed"
             ? "failed"
@@ -476,18 +519,60 @@ async function startServer() {
               ? "paid"
               : "completed";
 
-        if (payment) payment.status = status;
-        if (booking) {
-          booking.payment_status = status;
-          addNotification(
-            store,
-            booking.email,
-            "Payment update",
-            `Stripe marked ${booking.service_type} as ${status}.`,
-            "payment",
+        if (db) {
+          // ── Prisma path ──────────────────────────────────────────────────
+          const [payment, booking] = await Promise.all([
+            db.payment.findFirst({ where: { stripe_session_id: session.id } }),
+            session.metadata?.booking_id
+              ? db.booking.findUnique({ where: { id: session.metadata.booking_id } })
+              : null,
+          ]);
+
+          await Promise.all([
+            payment
+              ? db.payment.update({ where: { id: payment.id }, data: { status } })
+              : null,
+            booking
+              ? db.booking.update({
+                  where: { id: booking.id },
+                  data: { payment_status: status },
+                })
+              : null,
+            booking
+              ? db.notification.create({
+                  data: {
+                    id: randomUUID(),
+                    client_email: booking.email,
+                    title: "Payment update",
+                    body: `Stripe marked ${booking.service_type} as ${status}.`,
+                    type: "payment",
+                  },
+                })
+              : null,
+          ]);
+        } else {
+          // ── File-based fallback path ─────────────────────────────────────
+          const store = await readStore();
+          const payment = store.payments.find(
+            (item) => item.stripe_session_id === session.id,
           );
+          const booking = store.bookings.find(
+            (item) => item.id === session.metadata?.booking_id,
+          );
+
+          if (payment) payment.status = status;
+          if (booking) {
+            booking.payment_status = status;
+            addNotification(
+              store,
+              booking.email,
+              "Payment update",
+              `Stripe marked ${booking.service_type} as ${status}.`,
+              "payment",
+            );
+          }
+          await writeStore(store);
         }
-        await writeStore(store);
       }
 
       res.json({ received: true });
@@ -497,12 +582,18 @@ async function startServer() {
   app.use(express.json({ limit: "128kb" }));
 
   app.get("/health", (_req, res) => {
-    res.json({ status: "healthy" });
+    res.json({
+      status: "healthy",
+      storage: db ? "mysql" : "file",
+      database_url_set: Boolean(process.env.DATABASE_URL),
+    });
   });
 
   app.get("/api/catalog", (_req, res) => {
     res.json({ serviceCategories, subscriberPlans });
   });
+
+  // ── File upload ────────────────────────────────────────────────────────────
 
   app.post(
     "/api/files/upload",
@@ -531,6 +622,36 @@ async function startServer() {
       await fs.mkdir(uploadsDir, { recursive: true });
       await fs.writeFile(diskPath, decoded.buffer);
 
+      if (db) {
+        const record = await db.file.create({
+          data: {
+            id,
+            client_email: email,
+            uploaded_by: uploadedBy,
+            filename,
+            stored_name: storedName,
+            mime_type: decoded.mimeType,
+            size: decoded.buffer.length,
+            category: cleanText(body.category, 80) || "General",
+            note: cleanText(body.note, 1000),
+          },
+        });
+        await db.notification.create({
+          data: {
+            id: randomUUID(),
+            client_email: email,
+            title: uploadedBy === "admin" ? "New file added" : "File received",
+            body:
+              uploadedBy === "admin"
+                ? `${filename} was added to your portal.`
+                : `${filename} was uploaded to your Grace & Grind portal.`,
+            type: "file",
+          },
+        });
+        return res.status(201).json({ success: true, file: record });
+      }
+
+      // File-based fallback
       const store = await readStore();
       const record: FileRecord = {
         id,
@@ -544,7 +665,6 @@ async function startServer() {
         category: cleanText(body.category, 80) || "General",
         note: cleanText(body.note, 1000),
       };
-
       store.files.unshift(record);
       addNotification(
         store,
@@ -556,48 +676,87 @@ async function startServer() {
         "file",
       );
       await writeStore(store);
-
       res.status(201).json({ success: true, file: record });
     },
   );
 
+  // ── File download ──────────────────────────────────────────────────────────
+
   app.get("/api/files/:id/download", async (req, res) => {
-    const store = await readStore();
-    const file = store.files.find((item) => item.id === req.params.id);
-
-    if (!file) {
-      return res.status(404).json({ error: "File was not found." });
-    }
-
-    const requesterEmail = cleanEmail(req.query.email);
     const adminAllowed =
       req.headers["x-admin-code"] === getAdminCode() ||
       req.query.code === getAdminCode();
+    const requesterEmail = cleanEmail(req.query.email);
 
-    if (!adminAllowed && requesterEmail !== file.client_email) {
+    let fileRecord: { stored_name: string; filename: string; client_email: string } | null = null;
+
+    if (db) {
+      fileRecord = await db.file.findUnique({ where: { id: req.params.id } });
+    } else {
+      const store = await readStore();
+      fileRecord = store.files.find((item) => item.id === req.params.id) || null;
+    }
+
+    if (!fileRecord) {
+      return res.status(404).json({ error: "File was not found." });
+    }
+
+    if (!adminAllowed && requesterEmail !== fileRecord.client_email) {
       return res.status(403).json({ error: "File access denied." });
     }
 
-    const diskPath = path.resolve(uploadsDir, file.stored_name);
+    const diskPath = path.resolve(uploadsDir, fileRecord.stored_name);
     if (!diskPath.startsWith(path.resolve(uploadsDir))) {
       return res.status(400).json({ error: "Invalid file path." });
     }
 
-    res.download(diskPath, file.filename);
+    res.download(diskPath, fileRecord.filename);
   });
 
+  // ── Client signup ──────────────────────────────────────────────────────────
+
   app.post("/api/clients/signup", async (req, res) => {
+    const input = req.body as ClientRequest;
+    const name = cleanText(input.name, 160);
+    const email = cleanEmail(input.email);
+
+    if (!name) return res.status(400).json({ error: "Please enter your name." });
+    if (!email) return res.status(400).json({ error: "Please enter your email." });
+
+    if (db) {
+      const client = await db.client.upsert({
+        where: { email },
+        update: {
+          name,
+          phone: cleanText(input.phone, 80),
+          address: cleanText(input.address, 500),
+          preferred_contact: cleanText(input.preferred_contact, 80) || "Email",
+          notes: cleanText(input.notes),
+        },
+        create: {
+          id: randomUUID(),
+          name,
+          email,
+          phone: cleanText(input.phone, 80),
+          address: cleanText(input.address, 500),
+          preferred_contact: cleanText(input.preferred_contact, 80) || "Email",
+          notes: cleanText(input.notes),
+          notifications: {
+            create: {
+              id: randomUUID(),
+              title: "Welcome to Grace & Grind",
+              body: "Your client portal is ready. You can request services, sign documents, and message Grace & Grind from here.",
+              type: "welcome",
+            },
+          },
+        },
+      });
+      return res.status(201).json({ success: true, client });
+    }
+
+    // File-based fallback
     const store = await readStore();
-    const client = upsertClient(store, req.body as ClientRequest);
-
-    if (!client.name) {
-      return res.status(400).json({ error: "Please enter your name." });
-    }
-
-    if (!client.email) {
-      return res.status(400).json({ error: "Please enter your email." });
-    }
-
+    const client = upsertClient(store, input);
     addNotification(
       store,
       client.email,
@@ -609,40 +768,66 @@ async function startServer() {
     res.status(201).json({ success: true, client });
   });
 
+  // ── Portal data ────────────────────────────────────────────────────────────
+
   app.get("/api/portal", async (req, res) => {
     const email = cleanEmail(req.query.email);
-    const store = await readStore();
 
     if (!email) {
       return res.status(400).json({ error: "Email is required." });
     }
 
+    if (db) {
+      const [client, bookings, messages, notifications, documents, payments, files] =
+        await Promise.all([
+          db.client.findUnique({ where: { email } }),
+          db.booking.findMany({ where: { email }, orderBy: { created_at: "desc" } }),
+          db.message.findMany({ where: { client_email: email }, orderBy: { created_at: "desc" } }),
+          db.notification.findMany({ where: { client_email: email }, orderBy: { created_at: "desc" } }),
+          db.document.findMany({ where: { client_email: email }, orderBy: { created_at: "desc" } }),
+          db.payment.findMany({ where: { client_email: email }, orderBy: { created_at: "desc" } }),
+          db.file.findMany({ where: { client_email: email }, orderBy: { created_at: "desc" } }),
+        ]);
+      return res.json({ client, bookings, messages, notifications, documents, payments, files });
+    }
+
+    // File-based fallback
+    const store = await readStore();
     const client = store.clients.find((item) => item.email === email) || null;
     res.json({
       client,
       bookings: store.bookings.filter((item) => item.email === email),
       messages: store.messages.filter((item) => item.client_email === email),
-      notifications: store.notifications.filter(
-        (item) => item.client_email === email,
-      ),
+      notifications: store.notifications.filter((item) => item.client_email === email),
       documents: store.documents.filter((item) => item.client_email === email),
       payments: store.payments.filter((item) => item.client_email === email),
       files: store.files.filter((item) => item.client_email === email),
     });
   });
 
+  // ── Bookings ───────────────────────────────────────────────────────────────
+
   app.post("/api/bookings", async (req, res) => {
     const body = req.body as BookingRequest;
     const email = cleanEmail(body.email);
     const amount = calculateBookingAmount(body);
-    const booking: BookingRecord = {
+
+    const name = cleanText(body.name, 160);
+    const serviceType = cleanText(body.service_type);
+
+    if (!name) return res.status(400).json({ error: "Please enter your name." });
+    if (!serviceType) return res.status(400).json({ error: "Please select a service." });
+    if (!email && !cleanText(body.phone, 80)) {
+      return res.status(400).json({ error: "Please include an email or phone number." });
+    }
+
+    const bookingData = {
       id: randomUUID(),
-      created_at: new Date().toISOString(),
       client_email: email,
-      name: cleanText(body.name, 160),
+      name,
       email,
       phone: cleanText(body.phone, 80),
-      service_type: cleanText(body.service_type),
+      service_type: serviceType,
       subscriber_plan: cleanText(body.subscriber_plan),
       preferred_date: cleanText(body.preferred_date, 80),
       preferred_time: cleanText(body.preferred_time, 80),
@@ -655,69 +840,89 @@ async function startServer() {
       payment_status: amount.amount_cents ? "unpaid" : "quote_needed",
     };
 
-    if (!booking.name) {
-      return res.status(400).json({ error: "Please enter your name." });
+    if (db) {
+      if (email) {
+        await db.client.upsert({
+          where: { email },
+          update: { name, phone: bookingData.phone },
+          create: { id: randomUUID(), name, email, phone: bookingData.phone },
+        });
+      }
+      const booking = await db.booking.create({ data: bookingData });
+      if (email) {
+        await db.notification.create({
+          data: {
+            id: randomUUID(),
+            client_email: email,
+            title: "Booking request received",
+            body: `${booking.service_type} is saved at ${booking.rate_label}. Grace & Grind will confirm details before service.`,
+            type: "booking",
+          },
+        });
+      }
+      return res.status(201).json({ success: true, booking });
     }
 
-    if (!booking.service_type) {
-      return res.status(400).json({ error: "Please select a service." });
-    }
-
-    if (!booking.email && !booking.phone) {
-      return res
-        .status(400)
-        .json({ error: "Please include an email or phone number." });
-    }
-
+    // File-based fallback
+    const booking: BookingRecord = {
+      ...bookingData,
+      created_at: new Date().toISOString(),
+    };
     const store = await readStore();
-    if (booking.email) {
-      upsertClient(store, {
-        name: booking.name,
-        email: booking.email,
-        phone: booking.phone,
-      });
+    if (email) {
+      upsertClient(store, { name, email, phone: booking.phone });
       addNotification(
         store,
-        booking.email,
+        email,
         "Booking request received",
         `${booking.service_type} is saved at ${booking.rate_label}. Grace & Grind will confirm details before service.`,
         "booking",
       );
     }
     store.bookings.unshift(booking);
-
     await fs.mkdir(path.dirname(legacyBookingFile), { recursive: true });
-    await fs.appendFile(
-      legacyBookingFile,
-      `${JSON.stringify(booking)}\n`,
-      "utf8",
-    );
+    await fs.appendFile(legacyBookingFile, `${JSON.stringify(booking)}\n`, "utf8");
     await writeStore(store);
-
     res.status(201).json({ success: true, booking });
   });
 
+  // ── Payments / Stripe Checkout ─────────────────────────────────────────────
+
   app.post("/api/payments/checkout", async (req, res) => {
     const bookingId = cleanText(req.body?.booking_id, 160);
-    const store = await readStore();
-    const booking = store.bookings.find((item) => item.id === bookingId);
 
-    if (!booking) {
+    let bookingRecord: BookingRecord | null = null;
+
+    if (db) {
+      const found = await db.booking.findUnique({ where: { id: bookingId } });
+      if (found) {
+        bookingRecord = {
+          ...found,
+          created_at: found.created_at.toISOString(),
+          amount_cents: found.amount_cents ?? null,
+          booking_id: found.id,
+        } as unknown as BookingRecord;
+      }
+    } else {
+      const store = await readStore();
+      bookingRecord = store.bookings.find((item) => item.id === bookingId) || null;
+    }
+
+    if (!bookingRecord) {
       return res.status(404).json({ error: "Booking was not found." });
     }
 
     try {
-      const checkout = await createCheckoutForBooking(req, booking);
+      const checkout = await createCheckoutForBooking(req, bookingRecord);
 
       if ("error" in checkout) {
         return res.status(503).json(checkout);
       }
 
-      const payment: PaymentRecord = {
+      const paymentData = {
         id: randomUUID(),
-        created_at: new Date().toISOString(),
-        client_email: booking.email,
-        booking_id: booking.id,
+        client_email: bookingRecord.email,
+        booking_id: bookingRecord.id,
         stripe_session_id: checkout.session.id,
         checkout_url: checkout.session.url || undefined,
         amount_cents: checkout.amount,
@@ -725,7 +930,23 @@ async function startServer() {
         status: "created",
       };
 
-      booking.payment_status = "checkout_created";
+      if (db) {
+        const payment = await db.payment.create({ data: paymentData });
+        await db.booking.update({
+          where: { id: bookingRecord.id },
+          data: { payment_status: "checkout_created" },
+        });
+        return res.json({ success: true, url: checkout.session.url, payment });
+      }
+
+      // File-based fallback
+      const store = await readStore();
+      const payment: PaymentRecord = {
+        ...paymentData,
+        created_at: new Date().toISOString(),
+      };
+      const storeBooking = store.bookings.find((item) => item.id === bookingRecord!.id);
+      if (storeBooking) storeBooking.payment_status = "checkout_created";
       store.payments.unshift(payment);
       await writeStore(store);
       res.json({ success: true, url: checkout.session.url, payment });
@@ -736,41 +957,82 @@ async function startServer() {
     }
   });
 
+  // ── Messages ───────────────────────────────────────────────────────────────
+
   app.post("/api/messages", async (req, res) => {
     const email = cleanEmail(req.body?.email);
+    const body = cleanText(req.body?.body);
+    const subject = cleanText(req.body?.subject, 180) || "Client message";
+
+    if (!email || !body) {
+      return res.status(400).json({ error: "Email and message are required." });
+    }
+
+    if (db) {
+      const message = await db.message.create({
+        data: {
+          id: randomUUID(),
+          client_email: email,
+          from: "client",
+          subject,
+          body,
+          read_by_admin: false,
+          read_by_client: true,
+        },
+      });
+      return res.status(201).json({ success: true, message });
+    }
+
+    // File-based fallback
+    const store = await readStore();
     const message: MessageRecord = {
       id: randomUUID(),
       created_at: new Date().toISOString(),
       client_email: email,
       from: "client",
-      subject: cleanText(req.body?.subject, 180) || "Client message",
-      body: cleanText(req.body?.body),
+      subject,
+      body,
       read_by_admin: false,
       read_by_client: true,
     };
-
-    if (!email || !message.body) {
-      return res.status(400).json({ error: "Email and message are required." });
-    }
-
-    const store = await readStore();
     store.messages.unshift(message);
     await writeStore(store);
     res.status(201).json({ success: true, message });
   });
 
+  // ── Document signing ───────────────────────────────────────────────────────
+
   app.post("/api/documents/:id/sign", async (req, res) => {
     const signerName = cleanText(req.body?.signer_name, 160);
-    const store = await readStore();
-    const document = store.documents.find((item) => item.id === req.params.id);
-
-    if (!document) {
-      return res.status(404).json({ error: "Document was not found." });
-    }
 
     if (!signerName) {
       return res.status(400).json({ error: "Signer name is required." });
     }
+
+    if (db) {
+      const existing = await db.document.findUnique({ where: { id: req.params.id } });
+      if (!existing) return res.status(404).json({ error: "Document was not found." });
+
+      const document = await db.document.update({
+        where: { id: req.params.id },
+        data: { status: "signed", signer_name: signerName, signed_at: new Date() },
+      });
+      await db.notification.create({
+        data: {
+          id: randomUUID(),
+          client_email: document.client_email,
+          title: "Document signed",
+          body: `${document.title} was signed by ${signerName}.`,
+          type: "document",
+        },
+      });
+      return res.json({ success: true, document });
+    }
+
+    // File-based fallback
+    const store = await readStore();
+    const document = store.documents.find((item) => item.id === req.params.id);
+    if (!document) return res.status(404).json({ error: "Document was not found." });
 
     document.status = "signed";
     document.signer_name = signerName;
@@ -786,8 +1048,36 @@ async function startServer() {
     res.json({ success: true, document });
   });
 
+  // ── Admin overview ─────────────────────────────────────────────────────────
+
   app.get("/api/admin/overview", async (req, res) => {
     if (!requireAdmin(req, res)) return;
+
+    if (db) {
+      const [clients, bookings, messages, notifications, documents, payments, files] =
+        await Promise.all([
+          db.client.findMany({ orderBy: { created_at: "desc" } }),
+          db.booking.findMany({ orderBy: { created_at: "desc" } }),
+          db.message.findMany({ orderBy: { created_at: "desc" } }),
+          db.notification.findMany({ orderBy: { created_at: "desc" } }),
+          db.document.findMany({ orderBy: { created_at: "desc" } }),
+          db.payment.findMany({ orderBy: { created_at: "desc" } }),
+          db.file.findMany({ orderBy: { created_at: "desc" } }),
+        ]);
+      return res.json({
+        clients,
+        bookings,
+        messages,
+        notifications,
+        documents,
+        payments,
+        files,
+        catalog: { serviceCategories, subscriberPlans },
+        stripe_configured: Boolean(getStripeClient()),
+      });
+    }
+
+    // File-based fallback
     const store = await readStore();
     res.json({
       ...store,
@@ -796,19 +1086,46 @@ async function startServer() {
     });
   });
 
+  // ── Admin: update booking ──────────────────────────────────────────────────
+
   app.patch("/api/admin/bookings/:id", async (req, res) => {
     if (!requireAdmin(req, res)) return;
-    const store = await readStore();
-    const booking = store.bookings.find((item) => item.id === req.params.id);
 
-    if (!booking) {
-      return res.status(404).json({ error: "Booking was not found." });
+    const newStatus = cleanText(req.body?.status, 80);
+    const newPaymentStatus = cleanText(req.body?.payment_status, 80);
+
+    if (db) {
+      const existing = await db.booking.findUnique({ where: { id: req.params.id } });
+      if (!existing) return res.status(404).json({ error: "Booking was not found." });
+
+      const booking = await db.booking.update({
+        where: { id: req.params.id },
+        data: {
+          status: newStatus || existing.status,
+          payment_status: newPaymentStatus || existing.payment_status,
+        },
+      });
+      if (booking.email) {
+        await db.notification.create({
+          data: {
+            id: randomUUID(),
+            client_email: booking.email,
+            title: "Booking updated",
+            body: `${booking.service_type} is now marked ${booking.status}.`,
+            type: "booking",
+          },
+        });
+      }
+      return res.json({ success: true, booking });
     }
 
-    booking.status = cleanText(req.body?.status, 80) || booking.status;
-    booking.payment_status =
-      cleanText(req.body?.payment_status, 80) || booking.payment_status;
+    // File-based fallback
+    const store = await readStore();
+    const booking = store.bookings.find((item) => item.id === req.params.id);
+    if (!booking) return res.status(404).json({ error: "Booking was not found." });
 
+    booking.status = newStatus || booking.status;
+    booking.payment_status = newPaymentStatus || booking.payment_status;
     if (booking.email) {
       addNotification(
         store,
@@ -818,55 +1135,110 @@ async function startServer() {
         "booking",
       );
     }
-
     await writeStore(store);
     res.json({ success: true, booking });
   });
 
+  // ── Admin: reply to message ────────────────────────────────────────────────
+
   app.post("/api/admin/messages/reply", async (req, res) => {
     if (!requireAdmin(req, res)) return;
     const email = cleanEmail(req.body?.email);
+    const body = cleanText(req.body?.body);
+    const subject = cleanText(req.body?.subject, 180) || "Grace & Grind reply";
+
+    if (!email || !body) {
+      return res.status(400).json({ error: "Email and reply are required." });
+    }
+
+    if (db) {
+      const message = await db.message.create({
+        data: {
+          id: randomUUID(),
+          client_email: email,
+          from: "admin",
+          subject,
+          body,
+          read_by_admin: true,
+          read_by_client: false,
+        },
+      });
+      await db.notification.create({
+        data: {
+          id: randomUUID(),
+          client_email: email,
+          title: "New message",
+          body: message.subject,
+          type: "message",
+        },
+      });
+      return res.status(201).json({ success: true, message });
+    }
+
+    // File-based fallback
+    const store = await readStore();
     const message: MessageRecord = {
       id: randomUUID(),
       created_at: new Date().toISOString(),
       client_email: email,
       from: "admin",
-      subject: cleanText(req.body?.subject, 180) || "Grace & Grind reply",
-      body: cleanText(req.body?.body),
+      subject,
+      body,
       read_by_admin: true,
       read_by_client: false,
     };
-
-    if (!email || !message.body) {
-      return res.status(400).json({ error: "Email and reply are required." });
-    }
-
-    const store = await readStore();
     store.messages.unshift(message);
     addNotification(store, email, "New message", message.subject, "message");
     await writeStore(store);
     res.status(201).json({ success: true, message });
   });
 
+  // ── Admin: create document ─────────────────────────────────────────────────
+
   app.post("/api/admin/documents", async (req, res) => {
     if (!requireAdmin(req, res)) return;
     const email = cleanEmail(req.body?.email);
-    const document: DocumentRecord = {
-      id: randomUUID(),
-      created_at: new Date().toISOString(),
-      client_email: email,
-      title: cleanText(req.body?.title, 180),
-      body: cleanText(req.body?.body, 10000),
-      status: "needs_signature",
-    };
+    const title = cleanText(req.body?.title, 180);
+    const body = cleanText(req.body?.body, 10000);
 
-    if (!email || !document.title || !document.body) {
+    if (!email || !title || !body) {
       return res
         .status(400)
         .json({ error: "Client email, title, and document body are required." });
     }
 
+    if (db) {
+      const document = await db.document.create({
+        data: {
+          id: randomUUID(),
+          client_email: email,
+          title,
+          body,
+          status: "needs_signature",
+        },
+      });
+      await db.notification.create({
+        data: {
+          id: randomUUID(),
+          client_email: email,
+          title: "Document ready to sign",
+          body: `${document.title} is ready in your client portal.`,
+          type: "document",
+        },
+      });
+      return res.status(201).json({ success: true, document });
+    }
+
+    // File-based fallback
     const store = await readStore();
+    const document: DocumentRecord = {
+      id: randomUUID(),
+      created_at: new Date().toISOString(),
+      client_email: email,
+      title,
+      body,
+      status: "needs_signature",
+    };
     store.documents.unshift(document);
     addNotification(
       store,
@@ -878,6 +1250,8 @@ async function startServer() {
     await writeStore(store);
     res.status(201).json({ success: true, document });
   });
+
+  // ── Admin: send notification ───────────────────────────────────────────────
 
   app.post("/api/admin/notifications", async (req, res) => {
     if (!requireAdmin(req, res)) return;
@@ -891,6 +1265,20 @@ async function startServer() {
         .json({ error: "Client email, title, and body are required." });
     }
 
+    if (db) {
+      const notification = await db.notification.create({
+        data: {
+          id: randomUUID(),
+          client_email: email,
+          title,
+          body,
+          type: "admin",
+        },
+      });
+      return res.status(201).json({ success: true, notification });
+    }
+
+    // File-based fallback
     const store = await readStore();
     const notification = addNotification(store, email, title, body, "admin");
     await writeStore(store);
@@ -906,6 +1294,9 @@ async function startServer() {
   const port = process.env.PORT || 3000;
   server.listen(port, () => {
     console.log(`Grace & Grind website running on http://localhost:${port}/`);
+    if (db) {
+      console.log("tRPC router mounted at /trpc");
+    }
   });
 }
 

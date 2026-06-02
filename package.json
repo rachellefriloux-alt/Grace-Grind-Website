@@ -5,7 +5,9 @@
   "license": "MIT",
   "scripts": {
     "dev": "vite --host",
-    "build": "vite build && esbuild server/index.ts --platform=node --packages=external --bundle --format=esm --outdir=dist",
+    "build": "prisma generate && vite build && esbuild server/index.ts server/trpc.ts --platform=node --packages=external --bundle --format=esm --outdir=dist",
+    "db:migrate": "prisma migrate deploy",
+    "db:push": "prisma db push",
     "start": "node dist/index.js",
     "host": "npm run build && npm start",
     "preview": "vite preview --host",
@@ -13,12 +15,18 @@
     "format": "prettier --write ."
   },
   "dependencies": {
+    "@prisma/client": "latest",
+    "@tanstack/react-query": "latest",
+    "@trpc/client": "latest",
+    "@trpc/react-query": "latest",
+    "@trpc/server": "latest",
     "express": "^4.21.2",
     "lucide-react": "^0.453.0",
     "react": "^19.2.1",
     "react-dom": "^19.2.1",
     "stripe": "^22.2.0",
-    "wouter": "^3.3.5"
+    "wouter": "^3.3.5",
+    "zod": "latest"
   },
   "devDependencies": {
     "@tailwindcss/vite": "^4.1.14",
@@ -29,6 +37,7 @@
     "@vitejs/plugin-react": "^5.0.4",
     "esbuild": "^0.25.0",
     "prettier": "^3.6.2",
+    "prisma": "latest",
     "tailwindcss": "^4.1.14",
     "typescript": "5.6.3",
     "vite": "^7.1.7"
